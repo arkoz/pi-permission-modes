@@ -146,7 +146,11 @@ Cancelling replacement leaves its plan pending and restores the previous
 permission mode. Session-only grants and background shells are not restored
 by resuming the old conversation. Failed setup never falls back to
 implementation with old context: use `/resume` to recover the original plan
-and retry.
+and retry. The original plan is marked approved as soon as the replacement
+starts the kickoff turn, not after implementation finishes. If an input hook
+consumes or rewrites the kickoff instead, the original plan stays pending.
+An explicit clear-context command is tied to the plan present when invoked;
+if a running turn shows a different plan while it waits, approval expires.
 
 The pending plan survives `/reload`, resume, and branch navigation. Headless
 sessions get no prompts and no automatic switch. A `show_plan` in any other

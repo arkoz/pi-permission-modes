@@ -42,8 +42,12 @@ npm run typecheck # tsc --noEmit
 
 The pure-module tests run without any install. The dispatcher harness
 (`index.test.ts`) and the typecheck need the pi SDK - it resolves from the npm
-registry via `npm install`; without it the harness self-skips. CI runs both on
-Node 22, and **typecheck is blocking**.
+registry via `npm install`; without it the harness self-skips. The dispatcher
+harness models Pi 1.5.0's replacement lifecycle even when npm resolves an older
+SDK peer, using a test-only version shim while retaining the real SDK utilities.
+Fresh-session coverage therefore runs on a normal install; it does not establish
+real-host integration or OS containment. CI runs both on Node 22, and
+**typecheck is blocking**.
 
 ## Code layout
 

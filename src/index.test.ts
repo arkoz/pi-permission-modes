@@ -19,6 +19,7 @@
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import os, { tmpdir } from "node:os";
+import { registerHooks } from "node:module";
 import path from "node:path";
 import test from "node:test";
 import { readAuditState } from "./config-audit.ts";
@@ -27,21 +28,40 @@ import { docsDir } from "./docs.ts";
 type SetupExtension = (pi: unknown) => Promise<void>;
 
 // Resolve the extension entry once; undefined → SDK unavailable → skip all.
+let sdkFixture: { setSdkVersion(version: string): void } | undefined;
 const setupExtension: SetupExtension | undefined = await (async () => {
+  let hooks: ReturnType<typeof registerHooks> | undefined;
   try {
+    // FakePi models the supported host contract, independent of the installed
+    // peer's version. Keep the tiny shim here; real utilities (notably
+    // SessionManager persistence) still come from the installed SDK.
+    const sdkUrl = import.meta.resolve("@earendil-works/pi-coding-agent");
+    const fixtureUrl = `data:text/javascript,${encodeURIComponent(`
+      export * from ${JSON.stringify(sdkUrl)};
+      export let VERSION = "1.5.0";
+      export function setSdkVersion(version) { VERSION = version; }
+    `)}`;
+    hooks = registerHooks({
+      resolve(specifier, context, nextResolve) {
+        if (specifier === "@earendil-works/pi-coding-agent" && context.parentURL === new URL("./index.ts", import.meta.url).href) {
+          return nextResolve(fixtureUrl, context);
+        }
+        return nextResolve(specifier, context);
+      },
+    });
+    sdkFixture = await import(fixtureUrl);
     return (await import("./index.ts")).default as unknown as SetupExtension;
   } catch (e) {
     // Only a missing SDK is a reason to skip; anything else (a syntax Node's
     // type stripping rejects, a broken import) must fail loudly.
     if (/Cannot find (package|module) '@earendil-works/.test(String(e))) return undefined;
     throw e;
+  } finally {
+    hooks?.deregister();
   }
 })();
 const skip = setupExtension ? false : "pi SDK not installed (run npm install)";
-const skipFresh = skip || await (async () => {
-  const [major, minor] = String((await import("@earendil-works/pi-coding-agent")).VERSION).split(".").map(Number);
-  return major > 1 || (major === 1 && minor >= 5) ? false : "clear-context approval requires the Pi 1.5.0 lifecycle";
-})();
+const skipFresh = skip;
 
 // --- fake pi ----------------------------------------------------------------
 
@@ -158,7 +178,7 @@ interface FakeCtx {
     setStatus(key: string, value: string): void;
     theme: { fg(color: string, text: string): string };
   };
-  sessionManager: { getEntries(): Array<{ type: string; customType?: string; data?: unknown }>; getSessionId(): string; getSessionFile(): string | undefined };
+  sessionManager: { getEntries(): Array<{ type: string; customType?: string; data?: unknown }>; getSessionId(): string; getSessionFile(): string | undefined; getLeafId(): string | null };
   waitForIdle(): Promise<void>;
   newSession?: (options: ReplacementOptions) => Promise<{ cancelled: boolean }>;
   /** The session's model and registry, for the Auto classifier (the completion itself is scripted through globalThis). */
@@ -197,7 +217,7 @@ function makeCtx(cwd: string, opts: { hasUI?: boolean; entries?: Array<{ type: s
       },
       theme: { fg: (_color, text) => text },
     },
-    sessionManager: { getEntries: () => opts.entries ?? [], getSessionId: () => "sess-test", getSessionFile: () => undefined },
+    sessionManager: { getEntries: () => opts.entries ?? [], getSessionId: () => "sess-test", getSessionFile: () => undefined, getLeafId: () => null },
     waitForIdle: async () => {},
     model: { id: "fake-model", provider: "test" },
     modelRegistry: {
@@ -1632,9 +1652,10 @@ const FRESH_CHOICE = "Approve and clear context: implement in a fresh session";
 
 /** Actually rebuild the extension, seed metadata before session_start, invalidate old APIs. */
 function replaceable(h: Harness) {
-  const state = { calls: 0, cancel: false, fail: false, replacement: undefined as Harness | undefined, parent: undefined as string | undefined, seeded: [] as Array<{ type: string; customType?: string; data?: unknown }>, kickoffs: [] as string[], beforeStart: undefined as (() => void) | undefined };
+  const state = { calls: 0, cancel: false, fail: false, replacement: undefined as Harness | undefined, parent: undefined as string | undefined, seeded: [] as Array<{ type: string; customType?: string; data?: unknown }>, kickoffs: [] as string[], runs: 0, beforeStart: undefined as ((pi: FakePi) => void) | undefined, afterStart: undefined as (() => Promise<void>) | undefined };
   const sessionFile = path.join(h.base, "original.jsonl");
   h.ctx.sessionManager.getSessionFile = () => sessionFile;
+  h.ctx.sessionManager.getLeafId = () => `old${h.pi.entries.length}`;
   h.ctx.newSession = async (options) => {
     state.calls++;
     const gate = await h.pi.emit("session_before_switch", { reason: "new" }, h.ctx) as { cancel?: boolean } | undefined;
@@ -1658,12 +1679,13 @@ function replaceable(h: Harness) {
       state.seeded.push({ type: "custom", customType, data });
       return `seed${state.seeded.length}`;
     } });
-    state.beforeStart?.();
+    state.beforeStart?.(pi);
     const ctx = makeCtx(h.root);
     ctx.sessionManager = {
       getEntries: () => [...state.seeded, ...pi.entries.map((e) => ({ type: "custom", ...e }))],
       getSessionId: () => "fresh-session",
       getSessionFile: () => path.join(h.base, "fresh.jsonl"),
+      getLeafId: () => `seed${state.seeded.length}`,
     };
     await pi.emit("session_start", { reason: "new", previousSessionFile: sessionFile }, ctx);
     state.replacement = {
@@ -1673,8 +1695,18 @@ function replaceable(h: Harness) {
     };
     await options.withSession?.(Object.assign(ctx, { sendUserMessage: async (text: string) => {
       state.kickoffs.push(text);
-      await pi.emit("input", { text, source: "extension" }, ctx);
-      pi.sendUserMessage(text);
+      const input = await pi.emit("input", { text, source: "extension" }, ctx) as { action: string; text?: string } | undefined;
+      if (input?.action === "handled") return;
+      const prompt = input?.action === "transform" ? input.text! : text;
+      pi.sendUserMessage(prompt);
+      await pi.emit("before_agent_start", { prompt, systemPrompt: "BASE", systemPromptOptions: { sections: {} } }, ctx);
+      await pi.emit("agent_start", { type: "agent_start" }, ctx);
+      state.runs++;
+      // Real sendUserMessage resolves only after all implementation turns and
+      // continuations settle. Tests can hold this promise open after startup.
+      await state.afterStart?.();
+      await pi.emit("agent_end", { messages: [] }, ctx);
+      await pi.emit("agent_settled", { aborted: false }, ctx);
     } }));
     return { cancelled: false };
   };
@@ -1726,6 +1758,133 @@ test("clear-context prompt defers until settlement, replaces the runtime, and ki
       assert.match(reloaded.ctx.notices.at(-1) ?? "", /no plan pending/);
       assert.match(reloaded.ctx.status, /^Build /);
     } finally { reloaded.cleanup(); }
+  } finally { h.cleanup(); }
+});
+
+test("clear-context explicit commands reject plans replaced or changed while waiting for idle", { skip: skipFresh }, async () => {
+  for (const scenario of ["new-plan", "same-path", "changed", "legacy-changed"] as const) {
+    const entries = scenario === "legacy-changed" ? [{ type: "custom", customType: "perm-plan", data: { path: "plan/snapshot.md" } }] : undefined;
+    const h = await setup({ entries });
+    let release!: () => void;
+    const idle = new Promise<void>((resolve) => { release = resolve; });
+    try {
+      const state = replaceable(h);
+      await h.perm("plan");
+      if (scenario === "legacy-changed") {
+        mkdirSync(path.join(h.root, "plan"));
+        writeFileSync(path.join(h.root, "plan/snapshot.md"), "# Legacy plan\n");
+      } else await runWithShownPlan(h, "plan/snapshot.md");
+      let waiting = false;
+      h.ctx.waitForIdle = () => { waiting = true; return idle; };
+      const approval = h.pi.commands.get("plan")!("approve --clear-context", h.ctx);
+      assert.equal(waiting, true, "command snapshots before it waits");
+      if (scenario === "new-plan" || scenario === "same-path") {
+        await runWithShownPlan(h, scenario === "new-plan" ? "plan/replacement.md" : "plan/snapshot.md");
+      } else writeFileSync(path.join(h.root, "plan/snapshot.md"), "# Changed during wait\n");
+      release();
+      await approval;
+      assert.equal(state.calls, 0, scenario);
+      assert.equal(state.kickoffs.length, 0);
+      assert.match(h.ctx.notices.at(-1) ?? "", /approval expired/);
+      assert.match(h.ctx.status, /^Plan Mode /);
+      await h.pi.commands.get("plan")!("status", h.ctx);
+      assert.match(h.ctx.notices.at(-1) ?? "", /pending plan/);
+    } finally { release(); h.cleanup(); }
+  }
+});
+
+test("clear-context commits on kickoff start, before a long run settles, and only on the captured branch", { skip: skipFresh }, async () => {
+  const { SessionManager } = await import("@earendil-works/pi-coding-agent");
+  const h = await setup();
+  let release!: () => void;
+  const finishRun = new Promise<void>((resolve) => { release = resolve; });
+  let started!: () => void;
+  const runStarted = new Promise<void>((resolve) => { started = resolve; });
+  try {
+    const state = replaceable(h);
+    await h.perm("plan");
+    await runWithShownPlan(h, "plan/long.md");
+    // Another leaf exists by the time the replacement starts. Approval must
+    // attach to the captured planning leaf, not this newly reopened leaf.
+    state.beforeStart = () => {
+      const parent = SessionManager.open(state.parent!);
+      parent.branch("old0");
+      parent.appendCustomEntry("perm-plan", { path: "plan/another-branch.md" });
+    };
+    state.afterStart = async () => { started(); await finishRun; };
+    let settled = false;
+    const approval = h.pi.commands.get("plan")!("approve --clear-context", h.ctx).then(() => { settled = true; });
+    await runStarted;
+    assert.equal(settled, false, "real kickoff promise remains pending for the whole run");
+    const parent = SessionManager.open(state.parent!);
+    const committed = parent.getLeafEntry()!;
+    const handoff = state.seeded.find((e) => e.customType === "perm-plan-handoff")!.data as { parentLeafId: string };
+    assert.equal(committed.type, "custom");
+    assert.deepEqual((committed as { data?: unknown }).data, {}, "approval is durable before implementation finishes");
+    assert.equal(committed.parentId, handoff.parentLeafId, "approval is on the approved branch");
+    // A later branch must not receive a delayed approval when the long run
+    // finishes, or when Pi starts a continuation of that run.
+    parent.branch("old0");
+    parent.appendCustomEntry("perm-plan", { path: "plan/later.md" });
+    const laterLeaf = parent.getLeafId();
+    await state.replacement!.pi.emit("agent_start", {}, state.replacement!.ctx);
+    release();
+    await approval;
+    const reopened = SessionManager.open(state.parent!);
+    assert.equal(reopened.getLeafId(), laterLeaf);
+    assert.equal(reopened.getEntries().filter((e) => e.type === "custom" && e.customType === "perm-plan" && !(e.data as { path?: string }).path).length, 1);
+    await state.replacement!.pi.emit("session_shutdown", { reason: "quit" }, state.replacement!.ctx);
+  } finally { release(); h.cleanup(); }
+});
+
+test("clear-context handled or rewritten kickoff input never commits approval", { skip: skipFresh }, async () => {
+  for (const scenario of ["handled-before", "handled-after", "transformed"] as const) {
+    const h = await setup();
+    try {
+      const state = replaceable(h);
+      await h.perm("plan");
+      await runWithShownPlan(h, "plan/intercepted.md");
+      state.beforeStart = (pi) => {
+        let intercepted = false;
+        const hook = () => {
+          if (intercepted) return;
+          intercepted = true;
+          return scenario === "transformed" ? { action: "transform", text: "An unrelated task" } : { action: "handled" };
+        };
+        if (scenario === "handled-before") pi.handlers.get("input")!.unshift(hook);
+        else pi.on("input", hook);
+      };
+      await h.pi.commands.get("plan")!("approve --clear-context", h.ctx);
+      assert.equal(state.kickoffs.length, 1);
+      assert.equal(state.runs, scenario === "transformed" ? 1 : 0);
+      const original = readFileSync(state.parent!, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+      assert.equal(original.filter((e) => e.customType === "perm-plan").at(-1).data.path, "plan/intercepted.md");
+      const fresh = state.replacement!;
+      assert.match(fresh.ctx.notices.at(-1) ?? "", /kickoff did not start.*input hook may have intercepted/);
+      // Neither an unrelated run nor a later copy of the kickoff can consume
+      // a leftover acknowledgement from the intercepted attempt.
+      await fresh.pi.emit("input", { text: state.kickoffs[0], source: "interactive" }, fresh.ctx);
+      await fresh.pi.emit("before_agent_start", { prompt: state.kickoffs[0], systemPrompt: "BASE" }, fresh.ctx);
+      await fresh.pi.emit("agent_start", {}, fresh.ctx);
+      assert.equal(readFileSync(state.parent!, "utf8"), original.map((e) => JSON.stringify(e)).join("\n") + "\n");
+      await fresh.pi.emit("session_shutdown", { reason: "quit" }, fresh.ctx);
+    } finally { h.cleanup(); }
+  }
+});
+
+test("clear-context keeps approval durable if implementation fails after starting", { skip: skipFresh }, async () => {
+  const h = await setup();
+  try {
+    const state = replaceable(h);
+    await h.perm("plan");
+    await runWithShownPlan(h, "plan/run-error.md");
+    state.afterStart = async () => { throw new Error("implementation failed after startup"); };
+    await h.pi.commands.get("plan")!("approve --clear-context", h.ctx);
+    const original = readFileSync(state.parent!, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    assert.deepEqual(original.at(-1).data, {}, "a started handoff stays committed even if the run rejects");
+    assert.equal(original.at(-1).customType, "perm-plan");
+    assert.match(state.replacement!.ctx.notices.at(-1) ?? "", /implementation failed after startup/);
+    await state.replacement!.pi.emit("session_shutdown", { reason: "quit" }, state.replacement!.ctx);
   } finally { h.cleanup(); }
 });
 
@@ -1907,7 +2066,8 @@ test("fresh-session shutdown stops background shells and forgets session-only ap
   } finally { h.cleanup(); }
 });
 
-test("older Pi reports an actionable clear-context error instead of implementing in old context", { skip: skip || !skipFresh }, async () => {
+test("older Pi reports an actionable clear-context error instead of implementing in old context", { skip }, async () => {
+  sdkFixture!.setSdkVersion("0.78.1");
   const h = await setup();
   try {
     await h.perm("plan");
@@ -1918,7 +2078,10 @@ test("older Pi reports an actionable clear-context error instead of implementing
     assert.match(h.ctx.notices.at(-1) ?? "", /update Pi/);
     assert.equal(h.pi.messages.length, 0);
     assert.match(h.ctx.status, /^Plan Mode /);
-  } finally { h.cleanup(); }
+  } finally {
+    sdkFixture!.setSdkVersion("1.5.0");
+    h.cleanup();
+  }
 });
 
 test("plan approval A: Approve after the run switches to Build and sends the approval message once", { skip }, async () => {

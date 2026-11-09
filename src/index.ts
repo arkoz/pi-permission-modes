@@ -310,6 +310,9 @@ export default async function (pi: ExtensionAPI) {
   let approveModeWarned = false;
   let runtimeEnded = false;
   let handoffInProgress = false;
+  // Armed only by new-session startup, then consumed by its first input/run.
+  let incomingApproval: PlanHandoff | undefined;
+  let startingApproval: PlanHandoff | undefined;
   let deferredApproval: { id: string; plan: PendingPlan; sha: string; mode: string; session: string; dispatched: boolean } | undefined;
   const planCalls = new Map<string, string>(); // show_plan toolCallId -> requested path
   // Live network state: session domain grants/denies and the open toggle. The
@@ -971,18 +974,27 @@ export default async function (pi: ExtensionAPI) {
       approvalError(ctx, "clear-context approval requires Pi 1.5.0 or newer; update Pi, then retry /plan approve --clear-context");
       return;
     }
+    // Bind explicit commands to the plan the user approved, not whatever an
+    // in-flight run might show while waitForIdle is pending (including old,
+    // unhashed entries). Deferred commands get the same second validation.
+    const plan = pendingPlan;
+    if (!plan) {
+      approvalError(ctx, "no plan pending (show_plan has not rendered one in this session)");
+      return;
+    }
+    const sha = validatePlan(ctx, plan);
+    if (!sha) return;
+    const target = approveModeName();
+    const session = ctx.sessionManager.getSessionId();
     handoffInProgress = true;
-    const previousMode = modeName;
+    let previousMode: string | undefined;
     try {
       await ctx.waitForIdle();
-      const plan = pendingPlan;
-      if (!plan) {
-        approvalError(ctx, "no plan pending (show_plan has not rendered one in this session)");
+      if (runtimeEnded) return;
+      if (pendingPlan !== plan || ctx.sessionManager.getSessionId() !== session || approveModeName() !== target || validatePlan(ctx, plan) !== sha) {
+        approvalError(ctx, "clear-context approval expired because the plan, session, or approve mode changed; show_plan again");
         return;
       }
-      const sha = validatePlan(ctx, plan);
-      if (!sha) return;
-      const target = approveModeName();
       if (request && (request.sha !== sha || request.mode !== target)) {
         approvalError(ctx, "clear-context approval expired because the plan or approve mode changed; show_plan again");
         return;
@@ -992,6 +1004,7 @@ export default async function (pi: ExtensionAPI) {
         approvalError(ctx, "clear-context approval requires a saved parent session; restart Pi without --no-session so the original remains resumable");
         return;
       }
+      previousMode = modeName;
       approvingPlan = true;
       await setMode(target, ctx);
       await sandbox.settled();
@@ -1000,8 +1013,13 @@ export default async function (pi: ExtensionAPI) {
         return;
       }
       if (validatePlan(ctx, plan) !== sha) return;
-      const handoff: PlanHandoff = { id: randomUUID(), path: plan.path, sha, mode: target };
+      const parentLeafId = ctx.sessionManager.getLeafId();
+      if (!parentLeafId) {
+        approvalError(ctx, "clear-context approval requires a saved plan entry; show_plan again before approving");
+        return;
+      }
       const kickoff = freshApprovalMessage(config.plan?.approveMessage, plan.path);
+      const handoff: PlanHandoff = { id: randomUUID(), path: plan.path, sha, mode: target, parentSession, parentLeafId, kickoff };
       let replaced = false;
       const result = await ctx.newSession({
         parentSession,
@@ -1023,10 +1041,14 @@ export default async function (pi: ExtensionAPI) {
             if (readablePlanHash(replacement.cwd, handoff.path) !== handoff.sha) {
               throw new Error("saved plan changed or disappeared during replacement; show_plan again before approving");
             }
+            // This promise lasts for the WHOLE run, not just input acceptance.
+            // The replacement instance commits at agent_start, before any model
+            // request. A handled/transformed input must never count as approval.
             await replacement.sendUserMessage(kickoff);
-            // Commit only after kickoff was accepted. Open the outgoing file afresh,
-            // never reuse its invalidated SessionManager. Cancellation never gets here.
-            piSdk.SessionManager.open(parentSession).appendCustomEntry(PLAN_ENTRY, {});
+            const accepted = latestPlanHandoff(sessionBranch(replacement));
+            if (accepted?.id !== handoff.id || accepted.started !== true) {
+              throw new Error("kickoff did not start the approved implementation turn (an input hook may have intercepted it); the original plan remains pending");
+            }
           } catch (error) {
             approvalError(replacement, `fresh-session handoff failed: ${error instanceof Error ? error.message : String(error)}; the original session is resumable via /resume`);
           }
@@ -1045,7 +1067,7 @@ export default async function (pi: ExtensionAPI) {
     } finally {
       if (!runtimeEnded) {
         // Cancellation/failure before replacement must leave the planning session usable.
-        if (modeName !== previousMode) {
+        if (previousMode !== undefined && modeName !== previousMode) {
           await setMode(previousMode, ctx);
           await sandbox.settled();
         }
@@ -1893,7 +1915,9 @@ export default async function (pi: ExtensionAPI) {
       await sandbox.settled();
       if (modeName === incoming.mode && incoming.mode === approveModeName() && readablePlanHash(root, incoming.path) === incoming.sha &&
           (!currentMode().sandbox.enabled || sandbox.disabled || sandbox.ready)) {
-        pi.appendEntry<PlanHandoff>(PLAN_HANDOFF_ENTRY, { ...incoming, ready: true });
+        const ready = { ...incoming, ready: true };
+        pi.appendEntry<PlanHandoff>(PLAN_HANDOFF_ENTRY, ready);
+        incomingApproval = ready;
       }
     }
   });
@@ -1904,6 +1928,7 @@ export default async function (pi: ExtensionAPI) {
   pi.on("session_tree", async (_event, ctx) => {
     uiCtx = ctx;
     deferredApproval = undefined;
+    incomingApproval = startingApproval = undefined;
     pendingPlan = restorePendingPlan(sessionBranch(ctx)); // the branch's own plan state
     approvedPlan = approvedPlanOf(sessionBranch(ctx));
     planShownThisRun = false;
@@ -1914,6 +1939,7 @@ export default async function (pi: ExtensionAPI) {
   pi.on("session_shutdown", async (event, ctx) => {
     runtimeEnded = true;
     deferredApproval = undefined;
+    incomingApproval = startingApproval = undefined;
     approvals.clearAll(); // session-scoped grants don't outlive the session
     blocked.clear(); // nor do "Deny and block" paths
     net.clear(); // network grants/denies and the open toggle are session-scoped too
@@ -1944,9 +1970,27 @@ export default async function (pi: ExtensionAPI) {
   // once the agent is idle, so the plan is on screen and the accepting turn
   // starts under the approve mode's prompt, never under a Plan prompt still
   // in effect. Nothing is asked after the implementing run (no show_plan then).
-  pi.on("agent_start", async () => {
+  pi.on("agent_start", async (_event, ctx) => {
     deferredApproval = undefined;
     planShownThisRun = false;
+    const handoff = startingApproval;
+    startingApproval = undefined; // retries/continuations cannot commit twice
+    if (!handoff?.parentSession || !handoff.parentLeafId) return;
+    try {
+      // Never retain an outgoing SessionManager across replacement. Pin the
+      // commit to the approved branch, not a leaf reopened after implementation.
+      const parent = piSdk.SessionManager.open(handoff.parentSession);
+      parent.branch(handoff.parentLeafId);
+      const plan = restorePendingPlan(parent.getBranch());
+      if (plan?.path !== handoff.path || (plan.sha && plan.sha !== handoff.sha)) {
+        throw new Error("the original branch no longer contains the approved plan");
+      }
+      parent.appendCustomEntry(PLAN_ENTRY, {});
+      pi.appendEntry<PlanHandoff>(PLAN_HANDOFF_ENTRY, { ...handoff, started: true });
+    } catch (error) {
+      ctx.abort();
+      approvalError(ctx, `could not commit plan approval: ${error instanceof Error ? error.message : String(error)}; use /resume to recover the original session`);
+    }
   });
   // A verdict group spans one turn (the tool calls of one assistant message).
   pi.on("turn_start", async () => closeVerdictGroup());
@@ -2008,6 +2052,9 @@ export default async function (pi: ExtensionAPI) {
   // worker avoid failing commands) but skips the mode's STEERING systemPrompt,
   // which would misdirect a headless worker.
   pi.on("before_agent_start", async (event) => {
+    // Input hooks can consume or rewrite extension messages. Only the exact
+    // kickoff observed at input AND actually starting a run may commit.
+    if (event.prompt !== startingApproval?.kickoff) startingApproval = undefined;
     applyToolVisibility(); // keep hidden tools hidden as the tool set evolves
     const m = currentMode();
     const parts: PromptParts = {};
@@ -2037,6 +2084,8 @@ export default async function (pi: ExtensionAPI) {
   // Skill gating: skills aren't tools — they're invoked via `/skill:<name>` text,
   // so intercept the input before expansion and resolve the `skill` surface.
   pi.on("input", async (event, ctx) => {
+    startingApproval = event.source === "extension" && event.text === incomingApproval?.kickoff ? incomingApproval : undefined;
+    incomingApproval = undefined; // one attempt, even when a later hook handles it
     // A new instruction from the user may justify what the Auto classifier
     // refused: the refusals are forgotten, the allows kept.
     verdictCache.clearRefusals();

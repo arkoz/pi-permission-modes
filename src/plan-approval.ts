@@ -90,6 +90,13 @@ export interface PlanHandoff {
   sha: string;
   mode: string;
   ready?: boolean;
+  /** Plain commit coordinates; never an outgoing session-bound object. */
+  parentSession?: string;
+  parentLeafId?: string;
+  /** Exact message whose input/run-start pair acknowledges the handoff. */
+  kickoff?: string;
+  /** Set by the replacement at agent_start, not when sendUserMessage resolves. */
+  started?: boolean;
 }
 
 export function latestPlanHandoff(entries: SessionEntries): PlanHandoff | undefined {

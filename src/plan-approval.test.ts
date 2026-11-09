@@ -38,7 +38,8 @@ test("readablePlanHash: missing, unsafe, traversal and symlink escape fail close
 });
 
 test("latestPlanHandoff: only validated, latest handoff metadata is restored", () => {
-  const data = { id: "id", path: "plan/x.md", sha: "sha", mode: "build", ready: true };
+  const data = { id: "id", path: "plan/x.md", sha: "sha", mode: "build", ready: true,
+    parentSession: "/sessions/parent.jsonl", parentLeafId: "leaf", kickoff: "Implement the plan", started: true };
   assert.equal(latestPlanHandoff([]), undefined);
   assert.deepEqual(latestPlanHandoff([{ type: "custom", customType: "perm-plan-handoff", data }]), data);
   assert.equal(latestPlanHandoff([{ type: "custom", customType: "perm-plan-handoff", data: { id: "x" } }]), undefined);

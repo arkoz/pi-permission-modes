@@ -11,9 +11,14 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `/plan approve --clear-context` (Pi 1.5.0+). Implementation starts in a
   fresh session under the configured approve mode, with only the saved plan
   as its task handoff and normal project guidance reloaded. The original
-  planning session remains resumable as its parent. No conversation, summary,
+  planning session remains resumable as its parent. Approval is bound to the
+  pending plan when invoked and expires if the plan changes while waiting
+  for idle. The original branch is marked approved when the fresh session
+  starts the kickoff turn, not when implementation finishes; intercepted or
+  rewritten kickoff input leaves the plan pending. No conversation, summary,
   session-only grants, or background shells transfer. Ordinary approval and
-  decline keep their existing behavior. See `docs/modes.md`, "Approving a plan".
+  decline keep their existing behavior. Fresh-session dispatcher tests also
+  run with older installed SDK peers. See `docs/modes.md`, "Approving a plan".
 - **Auto mode.** A fifth stock mode between Build and YOLO: Build, but what
   Build would ask you about (a bash escape, a file tool outside the project,
   a host outside the allowlist, a web search, a first-use tool or skill) is
