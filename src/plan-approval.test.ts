@@ -1,12 +1,47 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { approvalMessage, DEFAULT_APPROVE_MESSAGE, restorePendingPlan, showPlanSucceeded, shownPlanPath } from "./plan-approval.ts";
+import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { approvalMessage, freshApprovalMessage, latestPlanHandoff, readablePlanHash, DEFAULT_APPROVE_MESSAGE, restorePendingPlan, showPlanSucceeded, shownPlanPath } from "./plan-approval.ts";
 
 test("approvalMessage: default template, {path} everywhere, empty template falls back", () => {
   assert.equal(approvalMessage(undefined, "plan/x.md"), "The plan in `plan/x.md` is approved. Implement it now.");
   assert.equal(approvalMessage("  ", "plan/x.md"), approvalMessage(DEFAULT_APPROVE_MESSAGE, "plan/x.md"));
   assert.equal(approvalMessage("Do {path}; file: {path}", "p.md"), "Do p.md; file: p.md");
   assert.equal(approvalMessage("No placeholder", "p.md"), "No placeholder");
+});
+
+test("freshApprovalMessage: preserves custom templates and always names the plan and guidance", () => {
+  for (const template of [undefined, "", "Go implement", "Do {path}, then check {path}"]) {
+    const message = freshApprovalMessage(template, "plan/x.md");
+    assert.ok(message.startsWith(approvalMessage(template, "plan/x.md")));
+    assert.match(message, /read the saved plan in `plan\/x.md`/);
+    assert.match(message, /AGENTS\.md and any instructions it references/);
+    assert.match(message, /no planning conversation or summary was transferred/);
+  }
+});
+
+test("readablePlanHash: missing, unsafe, traversal and symlink escape fail closed", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "perm-plan-"));
+  try {
+    mkdirSync(path.join(root, "plan"));
+    writeFileSync(path.join(root, "plan/x.md"), "# Plan");
+    writeFileSync(path.join(root, "outside.md"), "# Outside");
+    assert.match(readablePlanHash(root, "plan/x.md") ?? "", /^[a-f0-9]{64}$/);
+    for (const p of ["plan/missing.md", "../outside.md", "plan/../outside.md", "plan/x`y.md", "outside.md"]) assert.equal(readablePlanHash(root, p), undefined);
+    if (process.platform !== "win32") {
+      symlinkSync(path.join(root, "outside.md"), path.join(root, "plan/link.md"));
+      assert.equal(readablePlanHash(root, "plan/link.md"), undefined);
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("latestPlanHandoff: only validated, latest handoff metadata is restored", () => {
+  const data = { id: "id", path: "plan/x.md", sha: "sha", mode: "build", ready: true };
+  assert.equal(latestPlanHandoff([]), undefined);
+  assert.deepEqual(latestPlanHandoff([{ type: "custom", customType: "perm-plan-handoff", data }]), data);
+  assert.equal(latestPlanHandoff([{ type: "custom", customType: "perm-plan-handoff", data: { id: "x" } }]), undefined);
 });
 
 test("restorePendingPlan: the latest perm-plan entry wins; an approval entry clears it", () => {

@@ -91,7 +91,7 @@ retuned, and you can add your own ([docs/modes.md](docs/modes.md)).
 | Mode | Behavior |
 |------|----------|
 | **Default** | Confirm every `bash`/`edit`/`write`; reads are free. Approved **in-project** `bash` runs **sandboxed** (writes confined to the project). |
-| **Plan Mode** | Reads are free; in-project `bash` runs **sandboxed read-only**, so only read commands work. The one mutation allowed without confirmation is creating or editing **Markdown** inside the project. A system-prompt addition steers the model to write a plan to `plan/<date>_<description>.md`, render it with the **`show_plan`** tool, and hand over: an **Accept / Decline** prompt follows the plan ([approving a plan](docs/modes.md#approving-a-plan)). |
+| **Plan Mode** | Reads are free; in-project `bash` runs **sandboxed read-only**, so only read commands work. The one mutation allowed without confirmation is creating or editing **Markdown** inside the project. A system-prompt addition steers the model to write a plan to `plan/<date>_<description>.md`, render it with the **`show_plan`** tool, and hand over: an **Approve / Approve and clear context / Decline** prompt follows the plan ([approving a plan](docs/modes.md#approving-a-plan)). |
 | **Build** | Reads, writes, and `bash` **inside the project** run with no confirmation; in-project `bash` runs **sandboxed**. |
 | **Auto** | Build, but what Build would ask you about is **judged by a classifier** (a small side model call) against your task: a green check or a red cross in the conversation instead of a prompt. The judge never sees the agent's reasoning or tool output; a refusal is final until you say otherwise ([docs/modes.md](docs/modes.md#auto-mode)). |
 | **YOLO** | Never prompts, never sandboxes, no protected-path backstop. Can do anything the current user can. |
@@ -116,7 +116,7 @@ the network state: `Build (sandboxed in project dir, alt+m)  Network: filtered (
 | `/perm init` | Write a full copy of the stock defaults to the global config |
 | `/perm clear-approvals`, `/perm blocks`, `/perm unblock <path>` | Session grants and "Deny and block" paths |
 | `/perm verdicts` | This session's Auto verdicts |
-| `/plan approve`, `/plan status` | Plan approval |
+| `/plan approve`, `/plan approve --clear-context`, `/plan status` | Approve here, implement in a fresh session, or name the pending plan |
 | `/shells` | List and stop background shells |
 | `/sandbox` | The active sandbox configuration |
 | `pi --perm <mode>`, `pi --no-sandbox` | Start mode; keep the modes, drop OS sandboxing |

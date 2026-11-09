@@ -108,14 +108,27 @@ model's handoff line is on screen, a prompt appears:
 
 ```
 Plan ready: plan/2026-09-24_feature.md
-  > Accept: switch to Build and implement it
+  > Approve: switch to Build and implement it
+    Approve and clear context: implement in a fresh session
     Decline: keep refining in Plan Mode
 ```
 
-- **Accept** switches to the approve mode (`plan.approveMode`, Build by
+- **Approve** switches to the approve mode (`plan.approveMode`, Build by
   default) and sends a real user message (`plan.approveMessage`, with
   `{path}` replaced), so the implementing turn starts under Build's system
   prompt. The message is visible in the transcript.
+- **Approve and clear context** implements in a new session, with the same
+  approve mode and message. Only the saved plan is handed over: no previous
+  user/assistant messages, tool results, conversation summary, or session-only
+  permission/network grants are copied. Background shells end with the old
+  session. Pi reloads its normal system instructions, project guidance
+  (`AGENTS.md`, etc.), tools, and skills. The visible kickoff always instructs
+  the model to read the saved plan and applicable project guidance before
+  implementation, even if your custom `approveMessage` omits `{path}`.
+  This choice requires Pi 1.5.0 or newer and a saved session (not
+  `--no-session`), so its parent remains recoverable. It waits for the new mode
+  and sandbox to be ready; failures never fall back to implementation with old
+  context.
 - Approval covers what you saw: if the plan file changes after it was shown,
   approving is refused until the model shows it again.
 - **Decline** (or Esc) costs nothing. The plan stays pending and is not
@@ -123,8 +136,17 @@ Plan ready: plan/2026-09-24_feature.md
 - Switching into the approve mode by hand (`alt+m`, `/perm build`) while a
   plan is pending asks `Implement plan/... now?`; No leaves you in Build
   with nothing sent.
-- `/plan approve` switches and sends without asking; `/plan status` names
-  the pending plan.
+- `/plan approve` switches and sends without asking, in the current session.
+  `/plan approve --clear-context` is the explicit fresh-session equivalent;
+  `/plan status` names the pending plan.
+
+The fresh session links to the original as its parent. The planning session
+remains resumable through `/resume`; clearing context does not delete it.
+Cancelling replacement leaves its plan pending and restores the previous
+permission mode. Session-only grants and background shells are not restored
+by resuming the old conversation. Failed setup never falls back to
+implementation with old context: use `/resume` to recover the original plan
+and retry.
 
 The pending plan survives `/reload`, resume, and branch navigation. Headless
 sessions get no prompts and no automatic switch. A `show_plan` in any other

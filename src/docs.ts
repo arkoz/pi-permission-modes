@@ -43,6 +43,7 @@ export const DOC_REFS = {
   windowsTools: "troubleshooting.md#per-user-tools-on-windows",
   shells: "shells.md#background-shells",
   autoMode: "modes.md#auto-mode",
+  planApproval: "modes.md#approving-a-plan",
 } as const;
 
 export type DocRefKey = keyof typeof DOC_REFS;

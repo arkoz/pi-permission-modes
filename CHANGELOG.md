@@ -7,6 +7,13 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **Approve and clear context** in the plan-ready prompt, also available as
+  `/plan approve --clear-context` (Pi 1.5.0+). Implementation starts in a
+  fresh session under the configured approve mode, with only the saved plan
+  as its task handoff and normal project guidance reloaded. The original
+  planning session remains resumable as its parent. No conversation, summary,
+  session-only grants, or background shells transfer. Ordinary approval and
+  decline keep their existing behavior. See `docs/modes.md`, "Approving a plan".
 - **Auto mode.** A fifth stock mode between Build and YOLO: Build, but what
   Build would ask you about (a bash escape, a file tool outside the project,
   a host outside the allowlist, a web search, a first-use tool or skill) is
@@ -43,6 +50,8 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Plan approval now refuses missing/unsafe saved plans and does not start
+  implementation when a background-shell mode-switch confirmation is refused.
 - A bash argument that starts with a dash but is no flag (an echo label
   such as `--- which node/npm ---`) was read as a flag with a glued path
   (`/npm`) and prompted as a path outside the project. Only a flag-shaped

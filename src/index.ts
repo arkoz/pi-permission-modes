@@ -46,10 +46,11 @@
  */
 
 import { Type, type TSchema } from "@earendil-works/pi-ai";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import * as piSdk from "@earendil-works/pi-coding-agent";
 import { createBashTool, getAgentDir, getShellConfig } from "@earendil-works/pi-coding-agent";
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { effectiveClassifier, effectiveShells } from "./config-load.ts";
 import { type AdoptedRuntime, killWindowsTree, processViolations } from "./sandbox.ts";
 import { type ExposeEntry, formatEntry, INBOUND_FILE, INBOUND_SOURCE, InboundRouter, inboundPrelude, parseExpose, RELAY_FILE, RELAY_SOURCE, startRelays, withRelay } from "./shells/relay.ts";
@@ -118,6 +119,11 @@ import { isHostAllowed, NetworkSession, normalizeDomain, promptNote, type NetAsk
 import { blockablePath, canonicalPath, displayPath, insideRoots, isOutside, isProtectedWrite, normalizeToolPath, resolvePlanPath, sandboxAllowedRoots } from "./paths.ts";
 import {
   approvalMessage,
+  freshApprovalMessage,
+  latestPlanHandoff,
+  PLAN_HANDOFF_ENTRY,
+  type PlanHandoff,
+  readablePlanHash,
   DEFAULT_APPROVE_MODE,
   PLAN_ENTRY,
   type PendingPlan,
@@ -302,6 +308,9 @@ export default async function (pi: ExtensionAPI) {
   let planPrompting = false; // one approval prompt at a time
   let approvingPlan = false; // setMode called by approvePlan must not ask B
   let approveModeWarned = false;
+  let runtimeEnded = false;
+  let handoffInProgress = false;
+  let deferredApproval: { id: string; plan: PendingPlan; sha: string; mode: string; session: string; dispatched: boolean } | undefined;
   const planCalls = new Map<string, string>(); // show_plan toolCallId -> requested path
   // Live network state: session domain grants/denies and the open toggle. The
   // sandbox-runtime proxy consults it (via net.decide) for every host outside
@@ -889,6 +898,27 @@ export default async function (pi: ExtensionAPI) {
     return undefined;
   };
 
+  const approvalError = (ctx: ExtensionContext, message: string) => {
+    const text = `permission-mode: ${message}. See ${docRef("planApproval")}`;
+    if (ctx.hasUI) ctx.ui.notify(text, "warning");
+    else console.error(text);
+  };
+
+  /** Shared validation for both approval paths, including old unhashed session entries. */
+  const validatePlan = (ctx: ExtensionContext, plan: PendingPlan): string | undefined => {
+    if (pendingPlan !== plan || !approveModeDef(ctx)) return undefined;
+    const sha = readablePlanHash(root, plan.path);
+    if (!sha) {
+      approvalError(ctx, `${plan.path} is missing, unreadable, or not a safe plan path; show_plan again before approving`);
+      return undefined;
+    }
+    if (plan.sha && sha !== plan.sha) {
+      approvalError(ctx, `${plan.path} changed since it was shown; ask for show_plan again before approving`);
+      return undefined;
+    }
+    return sha;
+  };
+
   /**
    * Approve the pending plan: switch to the approve mode when not already
    * there, forget the plan (also in the session), and send the approval as a
@@ -896,13 +926,10 @@ export default async function (pi: ExtensionAPI) {
    */
   const approvePlan = async (ctx: ExtensionContext): Promise<boolean> => {
     const plan = pendingPlan;
-    if (!plan || !approveModeDef(ctx)) return false;
-    // Approval covers what the user saw: a plan file edited after show_plan
-    // rendered it (by the model in the same run, say) is not approved blindly.
-    if (plan.sha && planHash(root, plan.path) !== plan.sha) {
-      ctx.ui.notify(`permission-mode: ${plan.path} changed since it was shown; ask for show_plan again before approving`, "warning");
-      return false;
-    }
+    if (!plan || handoffInProgress) return false;
+    const sha = validatePlan(ctx, plan);
+    if (!sha) return false;
+    deferredApproval = undefined;
     const target = approveModeName();
     approvingPlan = true;
     try {
@@ -913,6 +940,7 @@ export default async function (pi: ExtensionAPI) {
     } finally {
       approvingPlan = false;
     }
+    if (modeName !== target || validatePlan(ctx, plan) !== sha) return false;
     pendingPlan = undefined;
     approvedPlan = plan.path; // part of the objective the Auto classifier judges against
     pi.appendEntry<PlanEntry>(PLAN_ENTRY, {});
@@ -924,6 +952,109 @@ export default async function (pi: ExtensionAPI) {
     return true;
   };
 
+  // Only the installed 1.5.0+ settled-dispatch/replacement contract is supported.
+  const freshSessionVersion = () => {
+    const [major, minor] = String(piSdk.VERSION).split(".").map(Number);
+    return major > 1 || (major === 1 && minor >= 5);
+  };
+
+  /** Command-only replacement: after newSession, no captured session-bound objects may be used. */
+  const approveFresh = async (ctx: ExtensionCommandContext, requestId?: string): Promise<void> => {
+    if (handoffInProgress) return;
+    const request = deferredApproval;
+    deferredApproval = undefined; // one shot, including validation failure or cancellation
+    if (requestId && (!request || request.id !== requestId || request.plan !== pendingPlan || request.session !== ctx.sessionManager.getSessionId())) {
+      approvalError(ctx, "clear-context approval expired; show the plan again or use /plan approve --clear-context");
+      return;
+    }
+    if (!freshSessionVersion() || typeof ctx.newSession !== "function" || typeof ctx.waitForIdle !== "function") {
+      approvalError(ctx, "clear-context approval requires Pi 1.5.0 or newer; update Pi, then retry /plan approve --clear-context");
+      return;
+    }
+    handoffInProgress = true;
+    const previousMode = modeName;
+    try {
+      await ctx.waitForIdle();
+      const plan = pendingPlan;
+      if (!plan) {
+        approvalError(ctx, "no plan pending (show_plan has not rendered one in this session)");
+        return;
+      }
+      const sha = validatePlan(ctx, plan);
+      if (!sha) return;
+      const target = approveModeName();
+      if (request && (request.sha !== sha || request.mode !== target)) {
+        approvalError(ctx, "clear-context approval expired because the plan or approve mode changed; show_plan again");
+        return;
+      }
+      const parentSession = ctx.sessionManager.getSessionFile();
+      if (!parentSession) {
+        approvalError(ctx, "clear-context approval requires a saved parent session; restart Pi without --no-session so the original remains resumable");
+        return;
+      }
+      approvingPlan = true;
+      await setMode(target, ctx);
+      await sandbox.settled();
+      if (modeName !== target) {
+        approvalError(ctx, "mode switch was refused; the plan remains pending");
+        return;
+      }
+      if (validatePlan(ctx, plan) !== sha) return;
+      const handoff: PlanHandoff = { id: randomUUID(), path: plan.path, sha, mode: target };
+      const kickoff = freshApprovalMessage(config.plan?.approveMessage, plan.path);
+      let replaced = false;
+      const result = await ctx.newSession({
+        parentSession,
+        setup: async (sm) => {
+          // setup runs before replacement session_start is emitted at rebind.
+          // Only extension metadata: no messages, summary, grants or network state.
+          sm.appendCustomEntry("perm-mode", { mode: handoff.mode });
+          sm.appendCustomEntry(PLAN_ENTRY, { path: handoff.path, sha: handoff.sha });
+          sm.appendCustomEntry(PLAN_ENTRY, {});
+          sm.appendCustomEntry(PLAN_HANDOFF_ENTRY, handoff);
+        },
+        withSession: async (replacement) => {
+          replaced = true;
+          try {
+            const ready = latestPlanHandoff(sessionBranch(replacement));
+            if (typeof replacement.sendUserMessage !== "function" || ready?.ready !== true || ready.id !== handoff.id || ready.mode !== handoff.mode) {
+              throw new Error("replacement mode or sandbox is not ready; fix /perm and /sandbox, then retry approval");
+            }
+            if (readablePlanHash(replacement.cwd, handoff.path) !== handoff.sha) {
+              throw new Error("saved plan changed or disappeared during replacement; show_plan again before approving");
+            }
+            await replacement.sendUserMessage(kickoff);
+            // Commit only after kickoff was accepted. Open the outgoing file afresh,
+            // never reuse its invalidated SessionManager. Cancellation never gets here.
+            piSdk.SessionManager.open(parentSession).appendCustomEntry(PLAN_ENTRY, {});
+          } catch (error) {
+            approvalError(replacement, `fresh-session handoff failed: ${error instanceof Error ? error.message : String(error)}; the original session is resumable via /resume`);
+          }
+        },
+      });
+      if (result.cancelled && !runtimeEnded) approvalError(ctx, "fresh-session approval cancelled; the plan remains pending");
+      else if (!result.cancelled && !replaced) {
+        const message = `Pi did not run withSession; update Pi and retry; no implementation was started. See ${docRef("planApproval")}`;
+        if (!runtimeEnded && ctx.hasUI) ctx.ui.notify(`permission-mode: ${message}`, "warning");
+        else console.error(`permission-mode: ${message}`);
+      }
+    } catch (error) {
+      const message = `fresh-session handoff failed: ${error instanceof Error ? error.message : String(error)}; use /resume to recover the original session. See ${docRef("planApproval")}`;
+      if (!runtimeEnded && ctx.hasUI) ctx.ui.notify(`permission-mode: ${message}`, "warning");
+      else console.error(`permission-mode: ${message}`); // old ctx is stale
+    } finally {
+      if (!runtimeEnded) {
+        // Cancellation/failure before replacement must leave the planning session usable.
+        if (modeName !== previousMode) {
+          await setMode(previousMode, ctx);
+          await sandbox.settled();
+        }
+        approvingPlan = false;
+        handoffInProgress = false;
+      }
+    }
+  };
+
   /** A: offer the plan shown during the run that just ended. Decline keeps it pending for B and C. */
   const offerPlanApproval = async (ctx: ExtensionContext): Promise<void> => {
     const plan = pendingPlan;
@@ -932,11 +1063,23 @@ export default async function (pi: ExtensionAPI) {
     if (!target) return;
     planPrompting = true;
     try {
-      const accept = `Accept: switch to ${target.label} and implement it`;
+      const accept = `Approve: switch to ${target.label} and implement it`;
+      const fresh = `Approve and clear context: implement in a fresh session`;
       const decline = `Decline: keep refining in ${currentMode().label}`;
-      const choice = await ctx.ui.select(`Plan ready: ${plan.path}`, [accept, decline]);
+      const choice = await ctx.ui.select(`Plan ready: ${plan.path}`, [accept, fresh, decline]);
+      if (pendingPlan !== plan || ctx.signal?.aborted) return;
       if (choice === accept) await approvePlan(ctx);
-      else plan.declined = true;
+      else if (choice === fresh) {
+        if (!freshSessionVersion()) {
+          approvalError(ctx, "clear-context approval requires Pi 1.5.0 or newer; update Pi and retry");
+          return;
+        }
+        const sha = validatePlan(ctx, plan);
+        if (sha) deferredApproval = { id: randomUUID(), plan, sha, mode: approveModeName(), session: ctx.sessionManager.getSessionId(), dispatched: false };
+      } else {
+        deferredApproval = undefined;
+        plan.declined = true;
+      }
     } finally {
       planPrompting = false;
     }
@@ -1104,9 +1247,14 @@ export default async function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("plan", {
-    description: "Plan approval: /plan approve (switch to the approve mode and implement the pending plan) | /plan status",
+    description: "Plan approval: /plan approve [--clear-context] | /plan status",
     handler: async (args, ctx) => {
       const arg = args.trim().toLowerCase();
+      const fresh = /^approve --clear-context(?: --request=([\w-]+))?$/.exec(arg);
+      if (fresh) {
+        await approveFresh(ctx, fresh[1]);
+        return;
+      }
       if (arg === "approve") {
         if (!pendingPlan) return ctx.ui.notify("permission-mode: no plan pending (show_plan has not rendered one in this session)", "warning");
         await approvePlan(ctx);
@@ -1118,7 +1266,7 @@ export default async function (pi: ExtensionAPI) {
           "info",
         );
       }
-      ctx.ui.notify("permission-mode: usage: /plan approve | status", "warning");
+      ctx.ui.notify("permission-mode: usage: /plan approve [--clear-context] | status", "warning");
     },
   });
 
@@ -1660,11 +1808,14 @@ export default async function (pi: ExtensionAPI) {
     // scratch; a session replaced inside the process keeps the current mode,
     // and the --perm flag only applies to the process start.
     const carry = event.reason !== undefined && event.reason !== "startup";
-    const picked = pickMode(ctx, !carry, carry);
+    const incoming = event.reason === "new" ? latestPlanHandoff(sessionBranch(ctx)) : undefined;
+    const picked = incoming && !incoming.ready && hasMode(config.modes, incoming.mode)
+      ? { name: incoming.mode, fallback: false } : pickMode(ctx, !carry, carry);
     modeName = picked.name;
     pendingPlan = restorePendingPlan(sessionBranch(ctx));
     approvedPlan = approvedPlanOf(sessionBranch(ctx));
     planShownThisRun = false;
+    deferredApproval = undefined;
     planCalls.clear();
     // Per-session scratch directory, created up front so the sandbox profile,
     // the bounds, and the awareness prompt all agree on it. Keyed on the
@@ -1738,9 +1889,21 @@ export default async function (pi: ExtensionAPI) {
     // is never recorded, like any implicit choice.
     const record = !picked.fallback && persistedMode(ctx) !== picked.name;
     await setMode(picked.name, ctx, record, picked.fallback);
+    if (incoming && !incoming.ready) {
+      await sandbox.settled();
+      if (modeName === incoming.mode && incoming.mode === approveModeName() && readablePlanHash(root, incoming.path) === incoming.sha &&
+          (!currentMode().sandbox.enabled || sandbox.disabled || sandbox.ready)) {
+        pi.appendEntry<PlanHandoff>(PLAN_HANDOFF_ENTRY, { ...incoming, ready: true });
+      }
+    }
   });
+  const cancelDeferredApproval = async () => { deferredApproval = undefined; };
+  pi.on("session_before_switch", cancelDeferredApproval);
+  pi.on("session_before_fork", cancelDeferredApproval);
+  pi.on("session_before_tree", cancelDeferredApproval);
   pi.on("session_tree", async (_event, ctx) => {
     uiCtx = ctx;
+    deferredApproval = undefined;
     pendingPlan = restorePendingPlan(sessionBranch(ctx)); // the branch's own plan state
     approvedPlan = approvedPlanOf(sessionBranch(ctx));
     planShownThisRun = false;
@@ -1749,6 +1912,8 @@ export default async function (pi: ExtensionAPI) {
     await setMode(picked.name, ctx, false, picked.fallback);
   });
   pi.on("session_shutdown", async (event, ctx) => {
+    runtimeEnded = true;
+    deferredApproval = undefined;
     approvals.clearAll(); // session-scoped grants don't outlive the session
     blocked.clear(); // nor do "Deny and block" paths
     net.clear(); // network grants/denies and the open toggle are session-scoped too
@@ -1780,6 +1945,7 @@ export default async function (pi: ExtensionAPI) {
   // starts under the approve mode's prompt, never under a Plan prompt still
   // in effect. Nothing is asked after the implementing run (no show_plan then).
   pi.on("agent_start", async () => {
+    deferredApproval = undefined;
     planShownThisRun = false;
   });
   // A verdict group spans one turn (the tool calls of one assistant message).
@@ -1788,6 +1954,25 @@ export default async function (pi: ExtensionAPI) {
     if (!planShownThisRun) return;
     planShownThisRun = false;
     await offerPlanApproval(ctx);
+  });
+
+  // Keep older peer SDKs type-checkable: they still support ordinary approval,
+  // but do not declare the 1.5.0 settled event or command-expansion option.
+  const freshPi = pi as unknown as {
+    on(event: "agent_settled", handler: (event: { aborted: boolean }, ctx: ExtensionContext) => Promise<void>): void;
+    sendUserMessage(message: string, options: { expandPromptTemplates: true }): void;
+  };
+  if (freshSessionVersion()) freshPi.on("agent_settled", async (event, ctx) => {
+    if (event.aborted) { deferredApproval = undefined; return; }
+    const request = deferredApproval;
+    if (!request || request.dispatched) return;
+    if (request.plan !== pendingPlan || request.session !== ctx.sessionManager.getSessionId()) {
+      deferredApproval = undefined;
+      return;
+    }
+    request.dispatched = true;
+    // No deliverAs: queued text would reach the model instead of command dispatch.
+    freshPi.sendUserMessage(`/plan approve --clear-context --request=${request.id}`, { expandPromptTemplates: true });
   });
 
   // Drop any unconsumed escape grant once the tool call resolves; record a
@@ -1806,6 +1991,7 @@ export default async function (pi: ExtensionAPI) {
     // The path ends up in a user-authored message: plain names only.
     if (!SAFE_PLAN_PATH.test(planPath)) return;
     const sha = planHash(root, planPath);
+    deferredApproval = undefined;
     pendingPlan = { path: planPath, declined: false, ...(sha ? { sha } : {}) };
     planShownThisRun = true;
     pi.appendEntry<PlanEntry>(PLAN_ENTRY, { path: planPath, ...(sha ? { sha } : {}) });

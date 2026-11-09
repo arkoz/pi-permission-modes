@@ -32,7 +32,7 @@ model and known limitations), [CHANGELOG.md](../CHANGELOG.md),
 | `/perm blocks`, `/perm unblock <path>` | List or lift this session's "Deny and block" paths |
 | `/perm verdicts` | List this session's Auto verdicts |
 | `/net status`, `/net allow <domain...>`, `/net open`, `/net restrict`, `/net reset` | Network allowlist, session grants, the open toggle |
-| `/plan approve`, `/plan status` | Approve the pending plan, or name it |
+| `/plan approve`, `/plan approve --clear-context`, `/plan status` | Approve here, implement in a fresh session, or name the pending plan |
 | `/sandbox` | Print the active sandbox configuration, or why the sandbox is unavailable |
 | `/sandbox install`, `/sandbox uninstall` | Windows: set up or remove the native sandbox (one UAC prompt each) |
 | `/shells`, `/shells stop <id|all> [signal]`, `/shells logs <id> [lines]`, `/shells clean` | Background shells: list, stop, read, tidy up |

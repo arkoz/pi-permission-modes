@@ -14,6 +14,7 @@
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import path from "node:path";
+import { canonicalPath, isPlanFile } from "./paths.ts";
 
 /** Plan paths that may appear in the approval message: plain names, no control characters, backticks, or quotes. */
 export const SAFE_PLAN_PATH = /^[\w./ -]+$/;
@@ -68,6 +69,38 @@ export const DEFAULT_APPROVE_MESSAGE = "The plan in `{path}` is approved. Implem
 export function approvalMessage(template: string | undefined, path: string): string {
   const t = template && template.trim() ? template : DEFAULT_APPROVE_MESSAGE;
   return t.split("{path}").join(path);
+}
+
+/** A fresh session must read the saved task, even when a custom template omits its path. */
+export function freshApprovalMessage(template: string | undefined, planPath: string): string {
+  return `${approvalMessage(template, planPath)}\n\nBefore implementation, read the saved plan in \`${planPath}\` and the applicable project guidance (AGENTS.md and any instructions it references). The saved plan is the task handoff; no planning conversation or summary was transferred.`;
+}
+
+/** Recheck both the displayed name and its symlink target before approval. */
+export function readablePlanHash(root: string, planPath: string): string | undefined {
+  if (!SAFE_PLAN_PATH.test(planPath) || !isPlanFile(root, planPath) || !isPlanFile(root, canonicalPath(root, planPath))) return undefined;
+  return planHash(root, planPath);
+}
+
+/** Metadata only: never copy the planning conversation into a fresh session. */
+export const PLAN_HANDOFF_ENTRY = "perm-plan-handoff";
+export interface PlanHandoff {
+  id: string;
+  path: string;
+  sha: string;
+  mode: string;
+  ready?: boolean;
+}
+
+export function latestPlanHandoff(entries: SessionEntries): PlanHandoff | undefined {
+  let found: PlanHandoff | undefined;
+  for (const e of entries) {
+    if (e.type !== "custom" || e.customType !== PLAN_HANDOFF_ENTRY) continue;
+    const d = e.data as Partial<PlanHandoff> | undefined;
+    found = d && typeof d.id === "string" && typeof d.path === "string" && typeof d.sha === "string" && typeof d.mode === "string"
+      ? d as PlanHandoff : undefined;
+  }
+  return found;
 }
 
 /** The pending plan recorded by the latest `perm-plan` entry, if that entry still names one. */
