@@ -55,6 +55,10 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Same-session automatic plan approval waits for Pi 1.5.0+'s `agent_settled`
+  before switching modes and starting implementation. Sending a follow-up
+  from `agent_end` could switch policy to Build while leaving the model under
+  stale Plan Mode instructions, requiring a manual `/perm build` to proceed.
 - Plan approval now refuses missing/unsafe saved plans and does not start
   implementation when a background-shell mode-switch confirmation is refused.
 - A bash argument that starts with a dash but is no flag (an echo label

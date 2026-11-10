@@ -116,7 +116,10 @@ Plan ready: plan/2026-09-24_feature.md
 - **Approve** switches to the approve mode (`plan.approveMode`, Build by
   default) and sends a real user message (`plan.approveMessage`, with
   `{path}` replaced), so the implementing turn starts under Build's system
-  prompt. The message is visible in the transcript.
+  prompt. On Pi 1.5.0+, the automatic approval waits for the planning run to
+  fully settle before switching and sending; it never queues implementation
+  as a continuation carrying the old Plan Mode instructions. The message is
+  visible in the transcript.
 - **Approve and clear context** implements in a new session, with the same
   approve mode and message. Only the saved plan is handed over: no previous
   user/assistant messages, tool results, conversation summary, or session-only

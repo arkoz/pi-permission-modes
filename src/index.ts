@@ -313,7 +313,7 @@ export default async function (pi: ExtensionAPI) {
   // Armed only by new-session startup, then consumed by its first input/run.
   let incomingApproval: PlanHandoff | undefined;
   let startingApproval: PlanHandoff | undefined;
-  let deferredApproval: { id: string; plan: PendingPlan; sha: string; mode: string; session: string; dispatched: boolean } | undefined;
+  let deferredApproval: { id: string; plan: PendingPlan; sha: string; mode: string; session: string; clearContext: boolean; dispatched: boolean } | undefined;
   const planCalls = new Map<string, string>(); // show_plan toolCallId -> requested path
   // Live network state: session domain grants/denies and the open toggle. The
   // sandbox-runtime proxy consults it (via net.decide) for every host outside
@@ -947,10 +947,10 @@ export default async function (pi: ExtensionAPI) {
     pendingPlan = undefined;
     approvedPlan = plan.path; // part of the objective the Auto classifier judges against
     pi.appendEntry<PlanEntry>(PLAN_ENTRY, {});
-    // agent_end fires while the run still counts as streaming (it settles
-    // after its listeners), and a plain send throws then. A follow-up is
-    // queued behind the finishing run and pi starts a fresh run for it; when
-    // the agent is idle (B via alt+m, /plan approve) it is sent right away.
+    // The automatic offer defers approval until agent_settled on Pi 1.5+:
+    // a busy follow-up continues the existing run WITHOUT before_agent_start,
+    // keeping its Plan prompt even though policy has switched to Build.
+    // Keep deliverAs for older hosts and explicit approvals during a run.
     pi.sendUserMessage(approvalMessage(config.plan?.approveMessage, plan.path), { deliverAs: "followUp" });
     return true;
   };
@@ -1090,14 +1090,14 @@ export default async function (pi: ExtensionAPI) {
       const decline = `Decline: keep refining in ${currentMode().label}`;
       const choice = await ctx.ui.select(`Plan ready: ${plan.path}`, [accept, fresh, decline]);
       if (pendingPlan !== plan || ctx.signal?.aborted) return;
-      if (choice === accept) await approvePlan(ctx);
-      else if (choice === fresh) {
+      if (choice === accept || choice === fresh) {
         if (!freshSessionVersion()) {
-          approvalError(ctx, "clear-context approval requires Pi 1.5.0 or newer; update Pi and retry");
+          if (choice === accept) await approvePlan(ctx);
+          else approvalError(ctx, "clear-context approval requires Pi 1.5.0 or newer; update Pi and retry");
           return;
         }
         const sha = validatePlan(ctx, plan);
-        if (sha) deferredApproval = { id: randomUUID(), plan, sha, mode: approveModeName(), session: ctx.sessionManager.getSessionId(), dispatched: false };
+        if (sha) deferredApproval = { id: randomUUID(), plan, sha, mode: approveModeName(), session: ctx.sessionManager.getSessionId(), clearContext: choice === fresh, dispatched: false };
       } else {
         deferredApproval = undefined;
         plan.declined = true;
@@ -2015,6 +2015,14 @@ export default async function (pi: ExtensionAPI) {
       return;
     }
     request.dispatched = true;
+    if (!request.clearContext) {
+      deferredApproval = undefined;
+      if (approveModeName() !== request.mode || validatePlan(ctx, request.plan) !== request.sha) return;
+      // Pi defers sends from this event until all settled handlers finish,
+      // then starts a new run with before_agent_start and fresh mode sections.
+      await approvePlan(ctx);
+      return;
+    }
     // No deliverAs: queued text would reach the model instead of command dispatch.
     freshPi.sendUserMessage(`/plan approve --clear-context --request=${request.id}`, { expandPromptTemplates: true });
   });

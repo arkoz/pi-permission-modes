@@ -1889,7 +1889,8 @@ test("clear-context keeps approval durable if implementation fails after startin
 });
 
 test("clear-context command honors the configured Auto mode/message and restores the classifier objective", { skip: skipFresh }, async () => {
-  const h = await setup({ globalConfig: { plan: { approveMode: "auto", approveMessage: "Custom implementation request" } } });
+  // Keep ../outside.txt outside policy bounds even when TMPDIR is under /tmp/pi.
+  const h = await setup({ globalConfig: { plan: { approveMode: "auto", approveMessage: "Custom implementation request" }, modes: { auto: { sandbox: { allowWrite: ["."] } } } } });
   try {
     const state = replaceable(h);
     await h.perm("plan");
@@ -2043,7 +2044,7 @@ test("both approval paths stop when a sandbox restart/mode switch is refused", {
 });
 
 test("fresh-session shutdown stops background shells and forgets session-only approvals/network grants", { skip: skipFresh || posixOnly }, async () => {
-  const h = await setup({ globalConfig: { modes: { plan: { sandbox: { enabled: false } } } } });
+  const h = await setup({ globalConfig: { modes: { plan: { sandbox: { enabled: false } }, build: { sandbox: { allowWrite: ["."] } } } } });
   try {
     const state = replaceable(h);
     await h.perm("plan");
@@ -2094,8 +2095,24 @@ test("plan approval A: Approve after the run switches to Build and sends the app
       title: "Plan ready: plan/2026-09-24_x.md",
       options: ["Approve: switch to Build and implement it", "Approve and clear context: implement in a fresh session", "Decline: keep refining in Plan Mode"],
     });
+    assert.match(h.ctx.status, /^Plan Mode /);
+    assert.equal(h.pi.messages.length, 0, "agent_end is still busy: a follow-up would reuse the Plan prompt");
+    // Model Pi's distinction: a busy follow-up does NOT emit before_agent_start;
+    // a send after settlement starts a new run and rebuilds its prompt sections.
+    let implementationPrompt: ReturnType<typeof startPrompt> | undefined;
+    const send = h.pi.sendUserMessage.bind(h.pi);
+    h.pi.sendUserMessage = (content, opts) => {
+      send(content, opts);
+      implementationPrompt = startPrompt(h);
+    };
+    await h.pi.emit("agent_settled", { aborted: false }, h.ctx);
+    await h.pi.emit("agent_settled", { aborted: false }, h.ctx);
     assert.match(h.ctx.status, /^Build /);
-    assert.deepEqual(h.pi.messages, [{ content: APPROVE_MSG("plan/2026-09-24_x.md"), opts: { deliverAs: "followUp" } }]); // queued: agent_end still counts as streaming
+    assert.deepEqual(h.pi.messages, [{ content: APPROVE_MSG("plan/2026-09-24_x.md"), opts: { deliverAs: "followUp" } }]);
+    const prompt = await implementationPrompt!;
+    assert.equal(prompt.sections.permission_mode_steering, undefined, "implementation must not retain Plan steering");
+    assert.doesNotMatch(prompt.systemPrompt, /Plan Mode|MUST NOT/);
+    assert.equal(await h.call("edit", { path: "src/example.ts" }), undefined, "Build policy allows project edits");
     // Persisted: shown, then approved (no path), so a resume does not re-offer it.
     const plan = h.pi.entries.filter((e) => e.customType === "perm-plan").map((e) => e.data as { path?: string; sha?: string });
     assert.equal(plan.length, 2);
@@ -2110,6 +2127,40 @@ test("plan approval A: Approve after the run switches to Build and sends the app
     await h.pi.emit("agent_end", { type: "agent_end", messages: [] }, h.ctx);
     assert.equal(h.ctx.prompts.length, before);
   } finally {
+    h.cleanup();
+  }
+});
+
+test("same-session approval expires on abort, continuation, changed plan, or session shutdown", { skip }, async () => {
+  for (const scenario of ["abort", "continuation", "changed-plan", "shutdown"] as const) {
+    const h = await setup();
+    try {
+      await h.perm("plan");
+      h.ctx.answers.push("Approve: switch to Build and implement it");
+      await runWithShownPlan(h, "plan/deferred.md");
+      assert.equal(h.pi.messages.length, 0);
+      if (scenario === "continuation") await h.pi.emit("agent_start", {}, h.ctx);
+      if (scenario === "changed-plan") writeFileSync(path.join(h.root, "plan/deferred.md"), "# Changed after acceptance\n");
+      if (scenario === "shutdown") await h.pi.emit("session_shutdown", { reason: "reload" }, h.ctx);
+      await h.pi.emit("agent_settled", { aborted: scenario === "abort" }, h.ctx);
+      assert.equal(h.pi.messages.length, 0, scenario);
+      assert.match(h.ctx.status, /^Plan Mode /, scenario);
+      assert.equal(h.pi.entries.filter((e) => e.customType === "perm-plan").length, 1, "no approval entry before implementation dispatch");
+    } finally { h.cleanup(); }
+  }
+});
+
+test("older Pi retains ordinary plan approval without a settled event", { skip }, async () => {
+  sdkFixture!.setSdkVersion("0.78.1");
+  const h = await setup();
+  try {
+    await h.perm("plan");
+    h.ctx.answers.push("Approve: switch to Build and implement it");
+    await runWithShownPlan(h, "plan/legacy.md");
+    assert.match(h.ctx.status, /^Build /);
+    assert.deepEqual(h.pi.messages.map((m) => m.content), [APPROVE_MSG("plan/legacy.md")]);
+  } finally {
+    sdkFixture!.setSdkVersion("1.5.0");
     h.cleanup();
   }
 });
@@ -2202,6 +2253,7 @@ test("plan approval: a missing approveMode warns once and disables A, B, and C; 
     await h.perm("plan");
     h.ctx.answers.push("Approve: switch to Default and implement it");
     await runWithShownPlan(h, "plan/2026-09-24_f.md");
+    await h.pi.emit("agent_settled", { aborted: false }, h.ctx);
     assert.match(h.ctx.status, /^Default /);
     assert.deepEqual(h.pi.messages.map((m) => m.content), ["Go: plan/2026-09-24_f.md (plan/2026-09-24_f.md)"]);
   } finally {
@@ -2288,7 +2340,7 @@ test("plan approval: a plan edited after show_plan is not approved blindly; unsa
 });
 
 test("bare-word symlink out of the project prompts as an escape and can be denied and blocked", { skip }, async () => {
-  const h = await setup();
+  const h = await setup({ globalConfig: { modes: { build: { sandbox: { allowWrite: ["."] } } } } });
   const outside = mkdtempSync(path.join(tmpdir(), "perm-bare-out-"));
   try {
     writeFileSync(path.join(outside, "secret.txt"), "top secret");
